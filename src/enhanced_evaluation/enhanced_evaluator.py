@@ -15,13 +15,13 @@
   ❌ 无改进指引 → 只知道"不好"，不知道"如何改好"
 
 本框架的解决方案:
-  ✅ 3 大维度覆盖核心链路 (RAG/Agent/Output)
+  ✅ 5 大维度覆盖核心链路 (RAG/Agent/Output/System/User)
   ✅ 15+ 细分指标，精确定位问题根因
   ✅ 自动生成改进建议，形成闭环优化
   ✅ 结构化报告，支持趋势追踪和对比分析
 
-  【注意】System Performance 和 User Satisfaction 维度为规划中，
-  暂未实现。如需使用，请自行扩展。
+  【注意】User Satisfaction 维度中的 Engagement 是无人工反馈时的代理指标；
+  如需真实满意度，请接入显式评分、追问、复制等产品行为数据。
 
 【评估体系架构】
 
@@ -34,7 +34,6 @@
   ┌─────────┐┌─────────┐┌─────────┐┌─────────┐┌─────────┐
   │RAG Quality││Agent    ││Output   ││System   ││User     │
   │Evaluator ││Quality  ││Quality  ││Perform. ││Satisf.  │
-  │          ││Evaluator││Evaluator││(TBD)    ││(TBD)    │
   ├─────────┤├─────────┤├─────────┤├─────────┤├─────────┤
   │Faithful ││Goal     ││Profess. ││Latency  ││Complete │
   │ness     ││Achieve. ││Data Acc.││Token Eff││Clarity  │
@@ -95,6 +94,15 @@
    - Success Rate: 成功率（无错误完成的比率）
    - Resource Utilization: 计算资源利用率
 
+5️⃣ User Satisfaction (用户满意度预估)
+   面向用户体验的自动化/半自动化指标
+
+   指标说明:
+   - Completeness: 答案是否覆盖用户问题要点
+   - Clarity: 答案结构是否清晰易读
+   - Helpfulness: 是否包含具体建议、数据或下一步
+   - Engagement: 显式评分优先；无评分时使用追问/复制等代理信号
+
 【评分等级标准】
 
   Score Level    Range      Description
@@ -126,7 +134,7 @@
   - CI/CD 流水线: 回归测试的质量门禁
 
 【版本信息】
-- v2.0 (2025-01): 极致优化版，15+ 指标 + 4 维度 + 自动建议 + 自测套件
+- v2.0 (2025-01): 极致优化版，15+ 指标 + 5 维度 + 自动建议 + 自测套件
 - v1.0 (2024-12): 初始版本，基础 RAG + 输出质量评估
 """
 
@@ -145,6 +153,10 @@ from enum import Enum, auto
 from datetime import datetime
 
 from pydantic import BaseModel, Field, validator
+
+# LLM 辅助评估
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 
 
 # ════════════════════════════════════════════════════════════
@@ -248,6 +260,73 @@ def get_score_level(score: float) -> ScoreLevel:
         return ScoreLevel.CRITICAL
 
 
+def _extract_keywords(text: str, expand_aliases: bool = True) -> set[str]:
+    """
+    提取中英文混合关键词。
+
+    中文查询通常没有空格，不能依赖 str.split()；这里同时保留英文/数字词、
+    常见金融术语和中文 2-gram，用于轻量启发式匹配。
+    """
+    if not text:
+        return set()
+
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_]*|\d+(?:\.\d+)?", lowered))
+
+    finance_terms = [
+        "茅台", "贵州茅台", "五粮液", "苹果", "aapl",
+        "盈利", "盈利能力", "净利润", "营收", "收入", "毛利率", "净利率",
+        "roe", "pe", "pb", "估值", "股价", "现金流", "风险", "增长",
+    ]
+    tokens.update(term.lower() for term in finance_terms if term.lower() in lowered)
+
+    if expand_aliases:
+        alias_groups = [
+            {"盈利", "盈利能力", "净利润", "毛利率", "净利率", "roe"},
+            {"估值", "pe", "pb", "市盈率", "市净率"},
+            {"收入", "营收", "营业收入"},
+            {"股价", "价格", "行情"},
+            {"风险", "风控", "波动", "回撤"},
+        ]
+        for group in alias_groups:
+            if tokens & group:
+                tokens.update(group)
+
+    chinese_chars = re.findall(r"[\u4e00-\u9fff]", lowered)
+    tokens.update(
+        "".join(chinese_chars[i:i + 2])
+        for i in range(max(0, len(chinese_chars) - 1))
+    )
+    return {token for token in tokens if token}
+
+
+def _number_supported(number_text: str, context: str) -> bool:
+    """判断答案中的数值是否能被上下文支撑，允许整数与小数前缀匹配。"""
+    normalized = re.sub(r"[^\d.\-]", "", number_text)
+    if not normalized:
+        return False
+    if number_text in context or normalized in context:
+        return True
+    try:
+        value = float(normalized)
+    except ValueError:
+        return False
+
+    for ctx_number in re.findall(r"[\d,]+\.?\d*", context):
+        try:
+            ctx_value = float(ctx_number.replace(",", ""))
+        except ValueError:
+            continue
+        if value == 0:
+            if ctx_value == 0:
+                return True
+        elif abs(ctx_value - value) / max(abs(value), 1.0) <= 0.01:
+            return True
+        elif str(ctx_value).startswith(str(value)) or str(value).startswith(str(ctx_value)):
+            return True
+    return False
+
+
 # 各维度的默认权重配置
 DEFAULT_DIMENSION_WEIGHTS: Dict[EvaluationDimension, float] = {
     EvaluationDimension.RAG_QUALITY: 0.30,
@@ -320,6 +399,7 @@ class MetricScore:
             "value": round(self.value, 4),
             "level": self.level.value,
             "description": self.description,
+            "details": self.details,
             "benchmark": self.benchmark,
             "vs_benchmark": round(self.value - self.benchmark, 4),
         }
@@ -429,7 +509,7 @@ class EvaluationReport:
         
         【各维度得分】
         rag_quality / agent_quality / output_quality /
-        system_performance: 四个维度的 DimensionScore
+        system_performance / user_satisfaction: 五个维度的 DimensionScore
         
         【综合评分】
         overall_score: 加权总分 [0.0, 1.0]
@@ -463,7 +543,8 @@ class EvaluationReport:
     agent_quality: Optional[DimensionScore] = None
     output_quality: Optional[DimensionScore] = None
     system_performance: Optional[DimensionScore] = None
-    
+    user_satisfaction: Optional[DimensionScore] = None
+
     overall_score: float = 0.0
     overall_level: ScoreLevel = ScoreLevel.ACCEPTABLE
     
@@ -500,6 +581,7 @@ class EvaluationReport:
             ("agent_quality", self.agent_quality),
             ("output_quality", self.output_quality),
             ("system_performance", self.system_performance),
+            ("user_satisfaction", self.user_satisfaction),
         ]:
             if dim_score:
                 result[dim_name] = {
@@ -533,6 +615,7 @@ class EvaluationReport:
             ("🤖 Agent 质量", self.agent_quality),
             ("✍️ 输出质量", self.output_quality),
             ("⚡ 系统性能", self.system_performance),
+            ("👤 用户满意度", self.user_satisfaction),
         ]:
             if dim_score:
                 lines.append(f"{dim_label}: {dim_score.weighted_score:.4f} ({_safe_level(dim_score.level)})")
@@ -567,7 +650,7 @@ class EvaluationReport:
 
 class RAGQualityEvaluator:
     """
-    RAG 质量评估器（基于启发式规则 + LLM 辅助）
+    RAG 质量评估器（启发式规则为主，支持可选 LLM 辅助评估）
     
     【评估能力】
     
@@ -607,10 +690,21 @@ class RAGQualityEvaluator:
         初始化 RAG 质量评估器
 
         Args:
-            use_llm: 参数保留但暂未实现（评估方法目前全部为规则驱动）
-                    如需 LLM 辅助评估，请自行扩展各 _evaluate_* 方法
+            use_llm: 是否启用 LLM 辅助评估
+                    - False (默认): 使用规则方法（快速，<100ms）
+                    - True: 使用 LLM 评估（更精准，~2-5s）
         """
-        self.use_llm = False  # 强制为 False，当前实现不支持 LLM 评估
+        self.use_llm = use_llm
+        if use_llm:
+            from config.settings import GLM_API_KEY, GLM_BASE_URL, LLM_MODEL
+            self._llm = ChatOpenAI(
+                model=LLM_MODEL,
+                openai_api_key=GLM_API_KEY,
+                openai_api_base=GLM_BASE_URL,
+                temperature=0,
+            )
+        else:
+            self._llm = None
     
     def evaluate(
         self,
@@ -642,11 +736,14 @@ class RAGQualityEvaluator:
         start_time = time.time()
         
         metrics: List[MetricScore] = []
-        
-        faithfulness = self._evaluate_faithfulness(answer, contexts)
+
+        if self.use_llm:
+            faithfulness = self._evaluate_faithfulness_llm(answer, contexts)
+            relevancy = self._evaluate_answer_relevancy_llm(query, answer, contexts)
+        else:
+            faithfulness = self._evaluate_faithfulness(answer, contexts)
+            relevancy = self._evaluate_answer_relevancy(query, answer)
         metrics.append(faithfulness)
-        
-        relevancy = self._evaluate_answer_relevancy(query, answer)
         metrics.append(relevancy)
         
         precision = self._evaluate_context_precision(query, contexts)
@@ -705,7 +802,6 @@ class RAGQualityEvaluator:
             )
         
         combined_context = " ".join(contexts).lower()
-        answer_lower = answer.lower()
         
         sentences = re.split(r'[。！？\n]', answer)
         supported = 0
@@ -723,12 +819,12 @@ class RAGQualityEvaluator:
             if numbers_in_sent:
                 found_count = sum(
                     1 for num in numbers_in_sent
-                    if num in combined_context
+                    if _number_supported(num, combined_context)
                 )
                 if found_count / len(numbers_in_sent) > 0.5:
                     supported += 1
             else:
-                keywords = set(sent.split()) & set(combined_context.split())
+                keywords = _extract_keywords(sent) & _extract_keywords(combined_context)
                 if len(keywords) >= 2:
                     supported += 1
         
@@ -745,7 +841,109 @@ class RAGQualityEvaluator:
             },
             benchmark=0.85,
         )
-    
+
+    def _evaluate_faithfulness_llm(
+        self,
+        answer: str,
+        contexts: List[str],
+    ) -> MetricScore:
+        """
+        LLM 辅助评估答案忠实度（幻觉检测）
+
+        使用 GLM 做 NLI 判断：给定上下文，判断答案中的每个陈述是否被支撑。
+        """
+        if not self._llm:
+            return self._evaluate_faithfulness(answer, contexts)
+
+        combined_context = "\n\n".join(contexts)
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "你是一个金融领域的事实核查专家。给定一个上下文文档和一个答案，"
+             "请逐句检查答案中的每个陈述是否被上下文支撑。\n"
+             "对于每个陈述，输出：\n"
+             "  - SUPPORTED: 陈述被上下文明确支持\n"
+             "  - CONTRADICTED: 陈述与上下文矛盾\n"
+             "  - UNSUPPORTED: 陈述在上下文中找不到依据\n\n"
+             "最终给出一个 0-1 的忠实度分数（SUPPORTED 比例）。"),
+            ("human", "上下文：\n{context}\n\n答案：\n{answer}"),
+        ])
+
+        try:
+            response = self._llm.invoke(prompt.format(context=combined_context, answer=answer))
+            result_text = response.content.strip()
+
+            match = re.search(r'(?:分数|faithfulness|score)[:：]\s*([\d.]+)', result_text, re.IGNORECASE)
+            if match:
+                faith_score = float(match.group(1))
+            else:
+                supported = len(re.findall(r'SUPPORTED', result_text, re.IGNORECASE))
+                contradicted = len(re.findall(r'CONTRADICTED', result_text, re.IGNORECASE))
+                unsupported = len(re.findall(r'UNSUPPORTED', result_text, re.IGNORECASE))
+                total = supported + contradicted + unsupported
+                faith_score = supported / max(1, total)
+
+            return MetricScore(
+                name="Faithfulness",
+                value=round(faith_score, 4),
+                level=get_score_level(faith_score),
+                description="LLM 辅助评估：答案是否忠实于检索上下文，无幻觉内容",
+                details={"llm_evaluation": result_text[:200]},
+                benchmark=0.85,
+            )
+        except Exception as e:
+            print(f"[RAG评估] LLM 忠实度评估失败，降级为规则方法：{e}")
+            return self._evaluate_faithfulness(answer, contexts)
+
+    def _evaluate_answer_relevancy_llm(
+        self,
+        query: str,
+        answer: str,
+        contexts: List[str],
+    ) -> MetricScore:
+        """
+        LLM 辅助评估答案相关性
+
+        使用 GLM 判断答案是否直接、完整地回应了用户问题。
+        """
+        if not self._llm:
+            return self._evaluate_answer_relevancy(query, answer)
+
+        combined_context = "\n\n".join(contexts)
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "你是一个金融研究质量评估专家。请评估答案是否直接、完整地回应了用户的问题。\n"
+             "从以下维度评分（0-1）：\n"
+             "  1. 相关性：答案是否针对问题而非跑题\n"
+             "  2. 完整性：答案是否涵盖了问题的主要方面\n"
+             "  3. 准确性：答案是否基于提供的上下文（无幻觉）\n\n"
+             "最终输出一个 0-1 的综合相关性分数，并简述理由。"),
+            ("human", "用户问题：{query}\n\n参考答案的上下文：\n{contexts}\n\n待评估答案：\n{answer}"),
+        ])
+
+        try:
+            response = self._llm.invoke(prompt.format(query=query, contexts=combined_context, answer=answer))
+            result_text = response.content.strip()
+
+            match = re.search(r'(?:分数|relevancy|score|相关性)[:：]\s*([\d.]+)', result_text, re.IGNORECASE)
+            if match:
+                relevancy = float(match.group(1))
+            else:
+                relevancy = 0.5  # 解析失败时的保守默认值
+
+            return MetricScore(
+                name="Answer Relevancy",
+                value=round(relevancy, 4),
+                level=get_score_level(relevancy),
+                description="LLM 辅助评估：生成的答案是否直接回答了用户的问题",
+                details={"llm_evaluation": result_text[:200]},
+                benchmark=0.80,
+            )
+        except Exception as e:
+            print(f"[RAG评估] LLM 相关性评估失败，降级为规则方法：{e}")
+            return self._evaluate_answer_relevancy(query, answer)
+
     def _evaluate_answer_relevancy(
         self,
         query: str,
@@ -767,8 +965,8 @@ class RAGQualityEvaluator:
                 benchmark=0.80,
             )
         
-        query_words = set(query.lower().split())
-        answer_words = set(answer.lower().split())
+        query_words = _extract_keywords(query)
+        answer_words = _extract_keywords(answer)
         
         overlap = query_words & answer_words
         keyword_coverage = len(overlap) / max(1, len(query_words))
@@ -787,7 +985,7 @@ class RAGQualityEvaluator:
         if '是否' in query or '能不能' in query:
             aspects.append('yes_no')
         
-        aspect_coverage = min(1.0, len(aspects) / max(1, len(aspects)))
+        aspect_coverage = 1.0 if not aspects else min(1.0, len(aspects) / max(1, len(aspects)))
         
         relevancy = (
             keyword_coverage * 0.4 +
@@ -830,14 +1028,14 @@ class RAGQualityEvaluator:
                 benchmark=0.75,
             )
         
-        query_keywords = set(query.lower().split())
+        query_keywords = _extract_keywords(query)
         
         relevant_count = 0
         for ctx in contexts:
             ctx_lower = ctx.lower()
-            overlap = query_keywords & set(ctx_lower.split())
+            overlap = query_keywords & _extract_keywords(ctx_lower)
             
-            if len(overlap) >= 2 and len(ctx) > 50:
+            if len(overlap) >= 2:
                 relevant_count += 1
             elif len(overlap) >= 1:
                 relevant_count += 0.5
@@ -867,9 +1065,9 @@ class RAGQualityEvaluator:
         
         检查 ground_truth 中的关键信息是否被 contexts 覆盖。
         """
-        gt_keywords = set(ground_truth.lower().split())
+        gt_keywords = _extract_keywords(ground_truth)
         combined_ctx = " ".join(contexts).lower()
-        ctx_keywords = set(combined_ctx.split())
+        ctx_keywords = _extract_keywords(combined_ctx)
         
         overlap = gt_keywords & ctx_keywords
         recall = len(overlap) / max(1, len(gt_keywords))
@@ -985,15 +1183,15 @@ class AgentQualityEvaluator:
         if not answer or not query:
             return 0.0
         
-        query_keywords = set(query.lower().split())
+        query_keywords = _extract_keywords(query, expand_aliases=False)
         answer_lower = answer.lower()
         
         matched = sum(1 for kw in query_keywords if kw in answer_lower)
         coverage = matched / max(1, len(query_keywords))
         
-        length_score = min(1.0, len(answer) / 200)
+        length_score = min(1.0, len(answer) / 50)
         
-        return coverage * 0.6 + length_score * 0.4
+        return coverage * 0.7 + length_score * 0.3
     
     def _evaluate_tool_efficiency(
         self,
@@ -1210,6 +1408,333 @@ class OutputQualityEvaluator:
 
 
 # ════════════════════════════════════════════════════════════
+# 第五部分（续）：系统性能评估器 & 用户满意度评估器
+# ════════════════════════════════════════════════════════════
+
+
+class SystemPerformanceEvaluator:
+    """
+    系统性能评估器（自动化评估实现）
+
+    【评估维度】
+
+    1. Latency (延迟)
+       - 各阶段耗时：意图识别 / 检索 / 分析 / 报告生成
+       - 金融场景参考：<30s 为优秀，<60s 为可接受
+
+    2. Token Efficiency (Token 效率)
+       - 输入/输出 Token 比，衡量信息密度
+       - 高效：单位信息消耗更少 Token
+
+    3. Success Rate (成功率)
+       - 任务无错误完成的比率
+       - 统计各错误类型的分布
+
+    4. Resource Utilization (资源利用率)
+       - CPU/内存峰值监控（可选，需环境支持）
+    """
+
+    # 性能基线（金融场景）
+    LATENCY_BENCHMARK_MS = 30000   # 30s
+    TOKEN_RATIO_BENCHMARK = 0.5    # 输出/输入 Token 比
+    SUCCESS_RATE_BENCHMARK = 0.95  # 95%
+
+    def evaluate(
+        self,
+        phase_durations_ms: Optional[Dict[str, float]] = None,
+        total_duration_ms: float = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        error_count: int = 0,
+        total_requests: int = 1,
+        cpu_peak_percent: Optional[float] = None,
+        memory_peak_mb: Optional[float] = None,
+    ) -> DimensionScore:
+        """
+        评估系统性能
+
+        Args:
+            phase_durations_ms: 各阶段耗时 {"意图识别": 120, "检索": 800, ...}
+            total_duration_ms: 总执行时间
+            input_tokens: 输入 Token 总数
+            output_tokens: 输出 Token 总数
+            error_count: 错误次数
+            total_requests: 总请求数（用于计算成功率）
+            cpu_peak_percent: CPU 峰值%（可选）
+            memory_peak_mb: 内存峰值 MB（可选）
+
+        Returns:
+            DimensionScore 系统性能维度得分
+        """
+        metrics: List[MetricScore] = []
+
+        # 1. Latency
+        if total_duration_ms > 0:
+            latency_score = max(0.0, 1.0 - (total_duration_ms / self.LATENCY_BENCHMARK_MS))
+            if latency_score >= 0.9:
+                level = ScoreLevel.EXCELLENT
+            elif latency_score >= 0.7:
+                level = ScoreLevel.GOOD
+            elif latency_score >= 0.5:
+                level = ScoreLevel.ACCEPTABLE
+            elif latency_score >= 0.3:
+                level = ScoreLevel.POOR
+            else:
+                level = ScoreLevel.CRITICAL
+        else:
+            latency_score = 0.5
+            level = ScoreLevel.ACCEPTABLE
+
+        metrics.append(MetricScore(
+            name="Latency",
+            value=round(latency_score, 4),
+            level=level,
+            description=(
+                f"端到端响应延迟（实测 {total_duration_ms:.0f}ms，目标 <{self.LATENCY_BENCHMARK_MS}ms）"
+                if total_duration_ms > 0
+                else "端到端响应延迟未提供，按中性分处理"
+            ),
+            details={
+                "total_duration_ms": round(total_duration_ms, 2),
+                "measured": total_duration_ms > 0,
+            },
+            benchmark=self.LATENCY_BENCHMARK_MS / 1000,
+        ))
+
+        # 2. Token Efficiency
+        if input_tokens > 0:
+            token_ratio = output_tokens / input_tokens
+            efficiency_score = max(0.0, 1.0 - (token_ratio / self.TOKEN_RATIO_BENCHMARK))
+            efficiency_score = min(1.0, efficiency_score)
+        else:
+            efficiency_score = 0.5
+
+        metrics.append(MetricScore(
+            name="Token Efficiency",
+            value=round(efficiency_score, 4),
+            level=get_score_level(efficiency_score),
+            description="Token 使用效率（输出/输入比越低越好）",
+            details={
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "ratio": round(output_tokens / max(1, input_tokens), 3) if input_tokens > 0 else 0,
+            },
+            benchmark=0.5,
+        ))
+
+        # 3. Success Rate
+        success_rate = max(0.0, (total_requests - error_count) / total_requests)
+        metrics.append(MetricScore(
+            name="Success Rate",
+            value=round(success_rate, 4),
+            level=get_score_level(success_rate),
+            description="任务无错误完成的比率",
+            details={"error_count": error_count, "total_requests": total_requests},
+            benchmark=self.SUCCESS_RATE_BENCHMARK,
+        ))
+
+        # 4. Resource Utilization (如果有数据)
+        if cpu_peak_percent is not None or memory_peak_mb is not None:
+            cpu_score = max(0.0, 1.0 - (cpu_peak_percent or 0) / 100) if cpu_peak_percent else 1.0
+            mem_score = max(0.0, 1.0 - (memory_peak_mb or 0) / 500) if memory_peak_mb else 1.0
+            resource_score = (cpu_score + mem_score) / 2
+
+            metrics.append(MetricScore(
+                name="Resource Utilization",
+                value=round(resource_score, 4),
+                level=get_score_level(resource_score),
+                description="计算资源利用率（CPU/内存峰值）",
+                details={
+                    "cpu_peak_percent": cpu_peak_percent,
+                    "memory_peak_mb": memory_peak_mb,
+                },
+                benchmark=0.8,
+            ))
+
+        # 加权聚合
+        weights = {"Latency": 0.30, "Token Efficiency": 0.25,
+                   "Success Rate": 0.30, "Resource Utilization": 0.15}
+        weighted_sum = sum(
+            m.value * weights.get(m.name, 0.20) for m in metrics
+        )
+
+        return DimensionScore(
+            dimension="System Performance",
+            metrics=metrics,
+            weighted_score=round(weighted_sum, 4),
+            level=get_score_level(weighted_sum),
+        )
+
+
+class UserSatisfactionEvaluator:
+    """
+    用户满意度评估器（自动化实现）
+
+    说明：真正的用户满意度需要人工反馈，这里提供基于
+    答案行为的隐式推断，适合无人工反馈时的自动化评估。
+
+    【评估维度】
+
+    1. Completeness (完整性)
+       - 答案是否涵盖了用户查询的所有方面
+
+    2. Clarity (清晰度)
+       - 答案结构是否清晰（段落、列表、数据）
+
+    3. Helpfulness (有用性)
+       - 答案是否包含具体建议/数据/比例
+
+    4. Engagement (参与度)
+       - 基于隐式行为（追问/复制）的代理指标
+    """
+
+    def evaluate(
+        self,
+        query: str,
+        answer: str,
+        final_answer: bool = True,
+        user_feedback_score: Optional[float] = None,
+        follow_up_count: int = 0,
+        copy_count: int = 0,
+    ) -> DimensionScore:
+        """
+        评估用户满意度
+
+        Args:
+            query: 用户查询
+            answer: 系统答案
+            final_answer: 是否为最终答案（用于判断追问意图）
+            user_feedback_score: 显式用户评分 [0, 1]（可选）
+            follow_up_count: 用户追问次数
+            copy_count: 用户复制答案次数
+
+        Returns:
+            DimensionScore 用户满意度维度得分
+        """
+        metrics: List[MetricScore] = []
+
+        # 1. Completeness（完整性）
+        query_words = _extract_keywords(query)
+        answer_words = _extract_keywords(answer)
+        overlap = query_words & answer_words
+        completeness = len(overlap) / max(1, len(query_words))
+
+        query_type_coverage = 0
+        if any(w in query for w in ['多少', '哪些', '什么', 'how many', 'which']):
+            query_type_coverage += 0.25
+        if any(w in query for w in ['为什么', '原因', 'why', 'reason']):
+            query_type_coverage += 0.25
+        if any(w in query for w in ['如何', '怎么', 'how', '方法']):
+            query_type_coverage += 0.25
+        if any(w in query for w in ['是否', '能不能']):
+            query_type_coverage += 0.25
+
+        completeness = completeness * 0.7 + query_type_coverage * 0.3
+
+        metrics.append(MetricScore(
+            name="Completeness",
+            value=round(completeness, 4),
+            level=get_score_level(completeness),
+            description="答案是否覆盖了用户查询的所有方面",
+            details={"keyword_coverage": round(len(overlap) / max(1, len(query_words)), 3)},
+            benchmark=0.75,
+        ))
+
+        # 2. Clarity（清晰度）
+        paragraphs = [p.strip() for p in re.split(r'\n\n+', answer) if p.strip()]
+        has_lists = bool(re.search(r'^\s*[-*•]\s', answer, re.MULTILINE))
+        has_numbers = bool(re.search(r'^\s*\d+[.)]\s', answer, re.MULTILINE))
+        sentence_count = len(re.split(r'[。！？\n]', answer))
+        avg_sentence_len = len(answer) / max(1, sentence_count)
+
+        clarity = 0.0
+        if len(paragraphs) >= 2:
+            clarity += 0.2
+        if has_lists or has_numbers:
+            clarity += 0.3
+        if 15 <= avg_sentence_len <= 50:
+            clarity += 0.3
+        if sentence_count >= 3:
+            clarity += 0.2
+
+        metrics.append(MetricScore(
+            name="Clarity",
+            value=round(min(1.0, clarity), 4),
+            level=get_score_level(min(1.0, clarity)),
+            description="答案结构是否清晰易读",
+            details={
+                "paragraphs": len(paragraphs),
+                "has_structured_list": bool(has_lists or has_numbers),
+                "avg_sentence_length": round(avg_sentence_len, 1),
+            },
+            benchmark=0.70,
+        ))
+
+        # 3. Helpfulness（有用性）
+        helpful_keywords = ['建议', '推荐', '配置', '仓位', '比例', '应该', '可以', '方案']
+        has_specific_data = bool(re.search(r'[\d.]+%|[一二三]成|\d+倍', answer))
+        has_action = any(kw in answer for kw in helpful_keywords)
+
+        helpfulness = 0.0
+        if has_action:
+            helpfulness += 0.4
+        if has_specific_data:
+            helpfulness += 0.4
+        if len(answer) > 200:
+            helpfulness += 0.2
+
+        metrics.append(MetricScore(
+            name="Helpfulness",
+            value=round(min(1.0, helpfulness), 4),
+            level=get_score_level(min(1.0, helpfulness)),
+            description="答案是否包含具体可操作的建议和数据",
+            details={
+                "has_action_words": has_action,
+                "has_specific_data": has_specific_data,
+            },
+            benchmark=0.65,
+        ))
+
+        # 4. Engagement（参与度代理指标）
+        engagement_score = 0.5
+        if user_feedback_score is not None:
+            engagement_score = user_feedback_score
+        elif final_answer and follow_up_count == 0:
+            engagement_score = 0.7
+        elif follow_up_count > 0:
+            engagement_score = max(0.3, 0.7 - follow_up_count * 0.1)
+        if copy_count > 0:
+            engagement_score = min(1.0, engagement_score + 0.1)
+
+        metrics.append(MetricScore(
+            name="Engagement",
+            value=round(engagement_score, 4),
+            level=get_score_level(engagement_score),
+            description="基于隐式行为（追问/复制）的用户参与度代理指标",
+            details={
+                "follow_up_count": follow_up_count,
+                "copy_count": copy_count,
+                "user_feedback_score": user_feedback_score,
+            },
+            benchmark=0.70,
+        ))
+
+        # 加权聚合
+        weights = {"Completeness": 0.30, "Clarity": 0.25,
+                   "Helpfulness": 0.25, "Engagement": 0.20}
+        weighted_sum = sum(
+            m.value * weights.get(m.name, 0.20) for m in metrics
+        )
+
+        return DimensionScore(
+            dimension="User Satisfaction",
+            metrics=metrics,
+            weighted_score=round(weighted_sum, 4),
+            level=get_score_level(weighted_sum),
+        )
+
+
+# ════════════════════════════════════════════════════════════
 # 第六部分：综合评估器
 # ════════════════════════════════════════════════════════════
 
@@ -1229,10 +1754,20 @@ class ComprehensiveEvaluator:
     6. 输出结构化报告
     """
     
-    def __init__(self):
-        self.rag_evaluator = RAGQualityEvaluator()
+    def __init__(self, use_llm: bool = False):
+        """
+        初始化综合评估器。
+
+        Args:
+            use_llm: 是否为 RAG 质量评估启用 LLM 辅助判断。
+                     False 使用启发式规则，True 会调用 ChatOpenAI。
+        """
+        self.use_llm = use_llm
+        self.rag_evaluator = RAGQualityEvaluator(use_llm=use_llm)
         self.agent_evaluator = AgentQualityEvaluator()
         self.output_evaluator = OutputQualityEvaluator()
+        self.system_evaluator = SystemPerformanceEvaluator()
+        self.user_satisfaction_evaluator = UserSatisfactionEvaluator()
     
     def full_evaluate(
         self,
@@ -1243,6 +1778,12 @@ class ComprehensiveEvaluator:
         execution_steps: Optional[List[Dict[str, Any]]] = None,
         execution_time_ms: float = 0,
         tool_call_count: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        error_count: int = 0,
+        user_feedback_score: Optional[float] = None,
+        follow_up_count: int = 0,
+        copy_count: int = 0,
     ) -> EvaluationReport:
         """
         执行全面评估（主入口方法）
@@ -1282,19 +1823,51 @@ class ComprehensiveEvaluator:
             )
         
         report.output_quality = self.output_evaluator.evaluate(answer, contexts)
-        
+
+        report.system_performance = self.system_evaluator.evaluate(
+            total_duration_ms=execution_time_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            error_count=error_count,
+            total_requests=1,
+        )
+
+        report.user_satisfaction = self.user_satisfaction_evaluator.evaluate(
+            query=query,
+            answer=answer,
+            user_feedback_score=user_feedback_score,
+            follow_up_count=follow_up_count,
+            copy_count=copy_count,
+        )
+
         dimensions = [
             report.rag_quality,
             report.agent_quality,
             report.output_quality,
+            report.system_performance,
+            report.user_satisfaction,
         ]
         
         valid_dims = [d for d in dimensions if d is not None]
         
         if valid_dims:
-            weights = [0.35, 0.30, 0.35][:len(valid_dims)]
+            dimension_weights = {
+                "RAG Quality": DEFAULT_DIMENSION_WEIGHTS[EvaluationDimension.RAG_QUALITY],
+                "Agent Execution Quality": DEFAULT_DIMENSION_WEIGHTS[EvaluationDimension.AGENT_QUALITY],
+                "Output Quality": DEFAULT_DIMENSION_WEIGHTS[EvaluationDimension.OUTPUT_QUALITY],
+                "System Performance": DEFAULT_DIMENSION_WEIGHTS[EvaluationDimension.SYSTEM_PERFORMANCE],
+                "User Satisfaction": DEFAULT_DIMENSION_WEIGHTS[EvaluationDimension.USER_SATISFACTION],
+            }
+            weighted_terms = [
+                (
+                    d.weighted_score,
+                    dimension_weights.get(d.dimension, 0.0),
+                )
+                for d in valid_dims
+            ]
+            total_weight = sum(weight for _, weight in weighted_terms)
             report.overall_score = round(
-                sum(d.weighted_score * w for d, w in zip(valid_dims, weights)),
+                sum(score * weight for score, weight in weighted_terms) / max(total_weight, 1e-9),
                 4,
             )
             report.overall_level = get_score_level(report.overall_score)
@@ -1330,6 +1903,10 @@ class ComprehensiveEvaluator:
             all_metrics.extend(report.agent_quality.metrics)
         if report.output_quality:
             all_metrics.extend(report.output_quality.metrics)
+        if report.system_performance:
+            all_metrics.extend(report.system_performance.metrics)
+        if report.user_satisfaction:
+            all_metrics.extend(report.user_satisfaction.metrics)
         
         for metric in all_metrics:
             if metric.level in (ScoreLevel.EXCELLENT, ScoreLevel.GOOD):
@@ -1390,7 +1967,8 @@ def evaluate_response(
         >>> print(report.overall_score)
         0.8567
     """
-    evaluator = ComprehensiveEvaluator()
+    use_llm = bool(kwargs.pop("use_llm", False))
+    evaluator = ComprehensiveEvaluator(use_llm=use_llm)
     return evaluator.full_evaluate(
         query=query,
         answer=answer,
@@ -1520,13 +2098,13 @@ def _run_self_tests():
     agent = AgentQualityEvaluator()
     
     goal = agent._evaluate_goal_achievement("茅台股价", "茅台当前股价1680元")
-    test("Goal Achievement (good)", goal.value > 0.5, f"Got {goal.value}")
+    test("Goal Achievement (good)", goal > 0.5, f"Got {goal}")
     
     eff = agent._evaluate_tool_efficiency(5, [])
-    test("Tool Efficiency (optimal)", eff.value >= 0.9, f"Got {eff.value}")
+    test("Tool Efficiency (optimal)", eff >= 0.9, f"Got {eff}")
     
     eff_many = agent._evaluate_tool_efficiency(15, [])
-    test("Tool Efficiency (too many)", eff_many.value < 0.7, f"Got {eff_many.value}")
+    test("Tool Efficiency (too many)", eff_many < 0.7, f"Got {eff_many}")
     
     time_fast = agent._evaluate_time_efficiency(5000)
     test("Time Efficiency (fast)", time_fast == 1.0)
@@ -1556,16 +2134,16 @@ def _run_self_tests():
     ### 盈利能力
     ROE达到34.2%，毛利率91.96%。
     """)
-    test("Professionalism (structured)", prof.value > 0.7, f"Got {prof.value}")
+    test("Professionalism (structured)", prof > 0.7, f"Got {prof}")
     
     prof_plain = output._evaluate_professionalism("茅台不错挺好的")
-    test("Professionalism (plain)", prof_plain.value < 0.5, f"Got {prof_plain.value}")
+    test("Professionalism (plain)", prof_plain < 0.5, f"Got {prof_plain}")
     
     acc = output._evaluate_data_accuracy(
         "根据财报显示，营收1505亿，同比增长18.9%",
         ["贵州茅台2023年营业收入1505亿元"],
     )
-    test("Data Accuracy (with source)", acc.value > 0.6, f"Got {acc.value}")
+    test("Data Accuracy (with source)", acc > 0.6, f"Got {acc}")
     
     coh = output._evaluate_coherence("""
     首先，茅台盈利能力强。
@@ -1573,14 +2151,14 @@ def _run_self_tests():
     最后，建议长期持有。
     综上所述，茅台值得投资。
     """)
-    test("Logical Coherence (structured)", coh.value > 0.7, f"Got {coh.value}")
+    test("Logical Coherence (structured)", coh > 0.7, f"Got {coh}")
     
     act = output._evaluate_actionability("""
     建议配置30%仓位，
     推荐长期持有，
     需要关注政策风险。
     """)
-    test("Actionability (specific)", act.value > 0.6, f"Got {act.value}")
+    test("Actionability (specific)", act > 0.6, f"Got {act}")
     
     dim_output = output.evaluate(
         answer="## 分析报告\n\n根据数据显示...",

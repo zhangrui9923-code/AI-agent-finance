@@ -116,7 +116,10 @@ def get_mcp_tools():
     import sys
     from pathlib import Path
     from langchain_mcp_adapters.client import MultiServerMCPClient
-    from langchain_mcp_adapters.tools import mcp_to_langchain
+    try:
+        from langchain_mcp_adapters.tools import mcp_to_langchain
+    except ImportError:
+        mcp_to_langchain = None
 
     server_script = str(Path(__file__).resolve())
 
@@ -131,6 +134,8 @@ def get_mcp_tools():
     async def _load():
         await client.__aenter__()
         mcp_tools = await client.get_tools()
+        if mcp_to_langchain is None:
+            return mcp_tools
         return mcp_to_langchain(mcp_tools)
 
     return asyncio.run(_load())
