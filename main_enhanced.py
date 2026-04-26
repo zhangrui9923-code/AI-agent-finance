@@ -521,9 +521,13 @@ class EnhancedFinancialAssistant:
             state = self._phase_4_task_planning(state)
             state = self._phase_4b_rag_retrieval(state)
             state = self._phase_5_react_execution(state)
-            
+
             if self.config.enable_evaluation:
                 state = self._phase_6_quality_evaluation(state)
+
+            # Phase 7: Report Generation (optional, for structured markdown output)
+            if state.get("rag_contexts") or state.get("financial_analysis"):
+                state = self._phase_7_report_generation(state)
             
             response_time = (time.time() - start_time) * 1000
             
@@ -1050,7 +1054,62 @@ class EnhancedFinancialAssistant:
                 print(f"   ❌ {phase_name} 失败: {e}")
         
         return state
-    
+
+    def _phase_7_report_generation(self, state: Dict) -> Dict:
+        """
+        Phase 7: 结构化报告生成
+
+        将 ReAct 执行结果、RAG 上下文、各模块分析结论整合，
+        生成标准 Markdown 研报格式。
+        """
+        phase_name = "Phase 7: 报告生成"
+        phase_start = time.time()
+
+        if self.config.verbose:
+            print(f"\n[{phase_name}] 📝 正在生成结构化研报...")
+
+        try:
+            from src.report.generator import ReportGenerator
+
+            generator = ReportGenerator()
+
+            # 构建 AgentState 兼容格式
+            agent_state = {
+                "user_query": state.get("original_query", ""),
+                "financial_analysis": self._extract_analysis_text(state),
+                "risk_assessment": state.get("risk_assessment", ""),
+                "realtime_data": state.get("realtime_data", ""),
+                "rag_contexts": state.get("rag_contexts", []),
+            }
+
+            # 调用报告生成器
+            output = generator.generate_report(agent_state)
+
+            state["final_report"] = output.get("final_report", "")
+            state["report_path"] = output.get("output_path", "")
+
+            phase_time = (time.time() - phase_start) * 1000
+            state["phase_results"]["report_generation"] = {
+                "status": "success",
+                "time_ms": round(phase_time, 1),
+            }
+
+            if self.config.verbose:
+                print(f"   ✅ 报告生成完成 ({phase_time:.0f}ms)")
+
+        except Exception as e:
+            state["errors"].append(f"{phase_name}: {str(e)}")
+            if self.config.verbose:
+                print(f"   ⚠️ {phase_name} 失败（不影响最终答案）: {e}")
+
+        return state
+
+    def _extract_analysis_text(self, state: Dict) -> str:
+        """从 state 中提取财务分析相关文本"""
+        if state.get("final_answer"):
+            return state["final_answer"]
+        return ""
+
     def _update_stats(self, success: bool, response_time: float) -> None:
         """更新会话统计信息"""
         stats = self._session_stats
@@ -1079,6 +1138,7 @@ class EnhancedFinancialAssistant:
             "task_plan": state.get("task_plan", []),
             
             "final_answer": state.get("final_answer"),
+            "final_report": state.get("final_report"),
             "execution_steps": state.get("execution_steps", []),
             "step_count": state.get("step_count", 0),
             

@@ -67,12 +67,21 @@ class ReportGenerator:
 
     def __call__(self, state: AgentState) -> AgentState:
         """
-        报告生成节点入口
+        报告生成节点入口（供 LangGraph 节点调用）
 
         汇总 state 中各 Agent 的输出，生成并保存最终研报。
         """
         query = state.get("user_query", "")
         print(f"[报告生成] 开始整合分析结果，生成研报...")
+
+        # rag_contexts: list from main_enhanced.py
+        # rag_context: string field in AgentState (from graph.py path)
+        # Handle both cases for compatibility
+        rag_contexts = state.get("rag_contexts") or state.get("rag_context") or []
+        if isinstance(rag_contexts, list):
+            rag_context = "\n".join(rag_contexts)
+        else:
+            rag_context = str(rag_contexts)
 
         # 汇总各 Agent 输出
         report_md = self._generate(
@@ -80,7 +89,7 @@ class ReportGenerator:
             financial_analysis=state.get("financial_analysis") or "",
             risk_assessment=state.get("risk_assessment") or "",
             realtime_data=state.get("realtime_data") or "",
-            rag_context=state.get("rag_context") or "",
+            rag_context=rag_context,
         )
 
         # 保存到文件
@@ -91,6 +100,42 @@ class ReportGenerator:
             **state,
             "final_report": report_md,
             "next_agent": NODE_END,
+        }
+
+    def generate_report(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        报告生成入口（供 main_enhanced.py 直接调用）
+
+        接收普通字典而非 AgentState，输出普通字典。
+        """
+        query = state.get("user_query", "") or state.get("query", "")
+        print(f"[报告生成] 开始整合分析结果，生成研报...")
+
+        rag_contexts = state.get("rag_contexts") or []
+        if isinstance(rag_contexts, list):
+            rag_context = "\n".join(rag_contexts[:3])  # 最多3个片段
+        else:
+            rag_context = str(rag_contexts)
+
+        financial_analysis = state.get("financial_analysis") or ""
+        if not financial_analysis and state.get("final_answer"):
+            financial_analysis = state.get("final_answer")
+
+        report_md = self._generate(
+            query=query,
+            financial_analysis=financial_analysis,
+            risk_assessment=state.get("risk_assessment") or "",
+            realtime_data=state.get("realtime_data") or "",
+            rag_context=rag_context,
+        )
+
+        metadata = self._save(query, report_md)
+        print(f"[报告生成] 研报已保存：{metadata.output_path}（{metadata.word_count} 字）")
+
+        return {
+            "final_report": report_md,
+            "output_path": metadata.output_path,
+            "word_count": metadata.word_count,
         }
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────

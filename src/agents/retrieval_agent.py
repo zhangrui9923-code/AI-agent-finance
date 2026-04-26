@@ -2,7 +2,10 @@
 检索 Agent（RAG Sub-Agent）
 
 职责：接收用户问题，执行 HyDE + Rerank 检索，将相关文档上下文写入共享状态。
-模式：ReAct —— 先检索，若结果不足则改写问题后再次检索（最多 2 轮）。
+
+注意：当前实现为最多 2 轮顺序检索（首轮 + 一次重试改写），
+并非完整的 ReAct 循环（无 action→observation→reasoning→next_action 的迭代）。
+如需完整 ReAct，需要重构为真正的循环结构。
 """
 
 from __future__ import annotations

@@ -468,7 +468,7 @@ class BM25Retriever:
                 self.inverted_index[term].append((doc.metadata['doc_id'], freq))
 ```
 
-**性能对比**：
+**性能对比**（需实际 benchmark 验证）：
 | 分词方案 | 召回率@10 | 精确率@10 | MRR |
 |---------|-----------|-----------|-----|
 | jieba 分词 | 78% | 65% | 0.72 |
@@ -602,7 +602,7 @@ class EnhancedRAGPipeline:
         return diverse_results
 ```
 
-**性能指标**：
+**性能指标**（需实际 benchmark 验证）：
 | 指标 | 传统 RAG | Enhanced RAG (Ours) | 提升 |
 |------|---------|---------------------|------|
 | Recall@5 | 72% | **91%** | +26% |

@@ -1210,75 +1210,136 @@ class EnhancedRAGPipeline:
         - 任何步骤异常 → 返回已有结果（优雅降级）
         """
         start_time = time.time()
-        
+
         _use_hyde = use_hyde if use_hyde is not None else self.config.use_hyde
         _top_k = top_k or self.config.top_k_final
-        
+
         print(f"[EnhancedRAG] 🔍 开始检索: {query[:60]}...")
-        
-        all_candidates: Dict[str, RetrievalResult] = {}
+
+        # Track results by content hash for proper fusion, not by prefix-key
+        content_hashes: Dict[str, RetrievalResult] = {}
+        channel_scores: Dict[str, Dict[str, float]] = {}  # hash -> {channel: raw_score}
         channel_counts = {
             RetrievalMethod.VECTOR: 0,
             RetrievalMethod.BM25: 0,
             RetrievalMethod.HYDE: 0,
         }
-        
+
         hyde_query = query
-        
+
         try:
             if _use_hyde:
                 hyde_query = self._generate_hypothetical_doc(query)
         except Exception as e:
             print(f"[EnhancedRAG] ⚠️ HyDE 生成异常: {e}")
             hyde_query = query
-        
+
+        def _add_result(result: RetrievalResult, channel: str) -> None:
+            """Add result to fusion tracking, avoiding content-level duplicates."""
+            content_hash = str(hash(result.content))
+            result.retrieval_method = channel
+            if content_hash not in content_hashes:
+                content_hashes[content_hash] = result
+                channel_scores[content_hash] = {}
+            # Keep the best-scoring RetrievalResult for this content
+            existing = content_hashes[content_hash]
+            if result.score > existing.score:
+                content_hashes[content_hash] = result
+            channel_scores[content_hash][channel] = result.score
+
         try:
             vector_results = self._vector_search(query, self.config.top_k_vector)
             for result in vector_results:
-                key = f"vec_{id(result)}_{result.chunk_index}"
-                result.retrieval_method = RetrievalMethod.VECTOR.value
-                all_candidates[key] = result
+                _add_result(result, RetrievalMethod.VECTOR.value)
                 channel_counts[RetrievalMethod.VECTOR] += 1
         except Exception as e:
             print(f"[EnhancedRAG] ⚠️ 向量检索异常: {e}")
-        
+
         if _use_hyde and hyde_query != query:
             try:
                 hyde_results = self._vector_search(hyde_query, self.config.top_k_vector)
                 for result in hyde_results:
-                    key = f"hyde_{id(result)}_{result.chunk_index}"
-                    result.retrieval_method = RetrievalMethod.HYDE.value
-                    
-                    if key in all_candidates:
-                        existing = all_candidates[key]
-                        result.score = max(result.score, existing.score)
-                    
-                    all_candidates[key] = result
+                    _add_result(result, RetrievalMethod.HYDE.value)
                     channel_counts[RetrievalMethod.HYDE] += 1
             except Exception as e:
                 print(f"[EnhancedRAG] ⚠️ HyDE 检索异常: {e}")
-        
+
         if self.config.use_bm25 and self.bm25_initialized:
             try:
                 bm25_results = self._bm25_search(query, self.config.top_k_bm25)
                 for result in bm25_results:
-                    key = f"bm25_{id(result)}_{result.chunk_index}"
-                    result.retrieval_method = RetrievalMethod.BM25.value
-                    
-                    if key in all_candidates:
-                        existing = all_candidates[key]
-                        fused_score = (
-                            existing.score * 0.6 +
-                            result.score * 0.4
-                        )
-                        result.score = fused_score
-                    
-                    all_candidates[key] = result
+                    _add_result(result, RetrievalMethod.BM25.value)
                     channel_counts[RetrievalMethod.BM25] += 1
             except Exception as e:
                 print(f"[EnhancedRAG] ⚠️ BM25 检索异常: {e}")
-        
-        candidates_list = list(all_candidates.values())
+
+        # Apply configured fusion strategy
+        fusion_strategy = self.config.fusion_strategy
+        fusion_weights = {
+            "vector": self.config.vector_weight,
+            "bm25": self.config.bm25_weight,
+            "hyde": self.config.hyde_weight,
+        }
+
+        if fusion_strategy == FusionStrategy.RRF:
+            # Reciprocal Rank Fusion: score = Σ 1/(k + rank_i)
+            # k=60 is the standard constant; rank is 1-based within each channel
+            RRF_K = 60
+            top_k_per_channel = max(self.config.top_k_vector, self.config.top_k_bm25)
+
+            # Collect per-channel ranked lists
+            channel_results: Dict[str, List[Tuple[float, RetrievalResult]]] = {
+                "vector": [],
+                "bm25": [],
+                "hyde": [],
+            }
+            for result in content_hashes.values():
+                for ch, score in channel_scores[str(hash(result.content))].items():
+                    if ch in channel_results:
+                        channel_results[ch].append((score, result))
+
+            # Sort each channel by score descending and assign ranks
+            for ch in channel_results:
+                channel_results[ch].sort(key=lambda x: x[0], reverse=True)
+
+            # Apply RRF formula
+            for content_hash, result in content_hashes.items():
+                rrf_score = 0.0
+                for ch in ["vector", "bm25", "hyde"]:
+                    ranked_list = channel_results[ch]
+                    for rank, (score, ranked_result) in enumerate(ranked_list, 1):
+                        if str(hash(ranked_result.content)) == content_hash:
+                            rrf_score += 1.0 / (RRF_K + rank)
+                            break
+                result.score = rrf_score
+
+        elif fusion_strategy == FusionStrategy.WEIGHTED_AVERAGE:
+            # Weighted fusion: score = Σ w_i * normalized_score_i
+            # Normalize each channel's scores to [0, 1] range
+            for ch in ["vector", "bm25", "hyde"]:
+                scores = [s[ch] for s in channel_scores.values() if ch in s]
+                if not scores:
+                    continue
+                min_s, max_s = min(scores), max(scores)
+                range_s = max_s - min_s if max_s > min_s else 1.0
+                for content_hash in content_hashes:
+                    if ch in channel_scores[content_hash]:
+                        norm = (channel_scores[content_hash][ch] - min_s) / range_s
+                        channel_scores[content_hash][ch] = norm
+
+            for content_hash, result in content_hashes.items():
+                weighted = sum(
+                    channel_scores[content_hash].get(ch, 0.0) * fusion_weights.get(ch, 0.0)
+                    for ch in ["vector", "bm25", "hyde"]
+                )
+                result.score = weighted
+
+        else:
+            # MAX_SCORE: score = max(score_1, score_2, ...)
+            for content_hash, result in content_hashes.items():
+                result.score = max(channel_scores[content_hash].values()) if channel_scores[content_hash] else 0.0
+
+        candidates_list = list(content_hashes.values())
         candidates_list.sort(key=lambda x: x.score, reverse=True)
         
         rerank_pool_size = min(_top_k * 4, len(candidates_list), 30)

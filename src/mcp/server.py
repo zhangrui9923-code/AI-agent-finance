@@ -116,8 +116,8 @@ def get_mcp_tools():
     import sys
     from pathlib import Path
     from langchain_mcp_adapters.client import MultiServerMCPClient
+    from langchain_mcp_adapters.tools import mcp_to_langchain
 
-    # MCP 服务器通过 stdio 启动（同进程 subprocess）
     server_script = str(Path(__file__).resolve())
 
     client = MultiServerMCPClient({
@@ -128,10 +128,10 @@ def get_mcp_tools():
         }
     })
 
-    # 同步包装：MultiServerMCPClient 是异步的，此处用 asyncio.run 封装
     async def _load():
         await client.__aenter__()
-        return client.get_tools()
+        mcp_tools = await client.get_tools()
+        return mcp_to_langchain(mcp_tools)
 
     return asyncio.run(_load())
 

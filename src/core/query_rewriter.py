@@ -1226,7 +1226,10 @@ class QueryRewriter:
 
 try:
     from src.core.slot_extractor import TIME_PATTERNS, COMPANY_ALIASES, FINANCIAL_METRICS
-except ImportError:
+except ImportError as e:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"[QueryRewriter] ⚠️ 未能导入 slot_extractor 常量: {e}，功能可能降级")
     TIME_PATTERNS: Dict[str, Any] = {}
     COMPANY_ALIASES: Dict[str, Any] = {}
     FINANCIAL_METRICS: Dict[str, Any] = {}

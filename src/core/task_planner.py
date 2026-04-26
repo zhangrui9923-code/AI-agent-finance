@@ -899,9 +899,26 @@ class TaskPlanner:
 
         # Step 1: 选择任务模板
         template: Optional[List[Dict[str, Any]]] = self._select_template(request.intent)
+
+        # Step 2: 无模板时调用 LLM 动态生成
         if not template:
-            logger.warning("[任务规划] ⚠️ 未找到匹配的模板，使用默认模板")
-            template = TASK_TEMPLATES.get("financial_analysis", [])
+            logger.warning("[任务规划] ⚠️ 未找到匹配模板，调用 LLM 动态生成计划")
+            llm_plan = self._generate_plan_with_llm(request)
+            end_time: datetime = datetime.now()
+            planning_time_ms: float = (end_time - start_time).total_seconds() * 1000
+
+            total_cost: float = sum(t.estimated_tokens for t in llm_plan.tasks)
+            result = TaskPlanningResult(
+                success=True,
+                plan=llm_plan,
+                execution_order=[[t.task_id for t in group] for group in self._optimize_execution_order(llm_plan.tasks)],
+                dependency_graph={t.task_id: t.dependencies for t in llm_plan.tasks},
+                planning_time_ms=planning_time_ms,
+                total_estimated_cost=total_cost,
+                risk_assessment=self._assess_plan_risk(llm_plan),
+            )
+            logger.info("[任务规划] ✅ LLM 动态生成完成")
+            return result
 
         # Step 2: 实例化任务（填充参数）
         tasks: List[Task] = self._instantiate_tasks(
@@ -928,7 +945,7 @@ class TaskPlanner:
         plan.parallel_groups = sum(1 for group in execution_order if len(group) > 1)
 
         total_cost: float = sum(t.estimated_tokens for t in tasks)
-        end_time: datetime = datetime.now()
+        end_time = datetime.now()
         planning_time_ms: float = (end_time - start_time).total_seconds() * 1000
 
         result = TaskPlanningResult(
@@ -978,6 +995,112 @@ class TaskPlanner:
             return TASK_TEMPLATES[mapped_intent]
 
         return None
+
+    def _generate_plan_with_llm(self, request: TaskPlanningRequest) -> TaskPlan:
+        """
+        使用 LLM 动态生成任务计划（模板不匹配时的兜底方案）。
+
+        通过 Few-shot Prompt 让 LLM 根据用户意图和槽位信息，
+        生成一个结构化的任务计划 DAG。
+
+        Returns:
+            TaskPlan: 包含 LLM 生成的任务列表和依赖关系
+        """
+        intent = request.intent or "unknown"
+        slots_json = json.dumps(request.slots or {}, ensure_ascii=False, indent=2)
+
+        prompt = (
+            "你是一个金融领域任务规划专家。根据用户查询和提取的槽位信息，"
+            "生成一个结构化的任务计划。\n\n"
+            f"用户查询: {request.query}\n"
+            f"意图类型: {intent}\n"
+            f"槽位信息:\n{slots_json}\n\n"
+            "任务类型列表:\n"
+            "  - data_retrieval: 从知识库/RAG 检索相关文档\n"
+            "  - financial_analysis: 基于检索数据进行深度财务分析\n"
+            "  - risk_assessment: 独立风险评估，挑战分析结论\n"
+            "  - realtime_data: 获取实时市场数据（股价、新闻）\n"
+            "  - quantitative_calc: 精确计算财务指标（PE、ROE 等）\n"
+            "  - report_generation: 整合结果生成研报\n\n"
+            "输出要求（严格 JSON 格式）:\n"
+            "{\n"
+            '  "tasks": [\n'
+            '    {"task_id": "T1", "task_type": "...", "description": "...", '
+            '"dependencies": [], "priority": "HIGH", "parameters": {}},\n'
+            '    {"task_id": "T2", "task_type": "...", "description": "...", '
+            '"dependencies": ["T1"], "priority": "MEDIUM", "parameters": {}}\n'
+            "  ]\n"
+            "}\n\n"
+            "注意:\n"
+            "  - priority 只允许: CRITICAL, HIGH, MEDIUM, LOW\n"
+            "  - dependencies 使用 task_id 列表，空列表表示无前置依赖\n"
+            "  - task_type 必须是上面列表中的值\n"
+            "  - 只输出 JSON，不要任何解释"
+        )
+
+        response = self._llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response.content.strip()
+
+        # 提取 JSON（可能包裹在 markdown code block 中）
+        json_text = raw_text
+        if "```json" in raw_text:
+            json_text = raw_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_text:
+            json_text = raw_text.split("```")[1].split("```")[0].strip()
+
+        try:
+            plan_data = json.loads(json_text)
+        except json.JSONDecodeError:
+            logger.error("[任务规划] ❌ LLM 返回 JSON 解析失败，使用默认模板")
+            fallback_template = TASK_TEMPLATES.get("financial_analysis", [])
+            return TaskPlan(
+                plan_id=str(uuid.uuid4())[:8],
+                user_query=request.query,
+                intent=request.intent,
+                tasks=self._instantiate_tasks(fallback_template, request.slots or {}, request.query),
+                total_tasks=len(fallback_template),
+                created_at=datetime.now().isoformat(),
+                planning_strategy="llm_fallback",
+            )
+
+        tasks: List[Task] = []
+        for item in plan_data.get("tasks", []):
+            try:
+                task = Task(
+                    task_id=item["task_id"],
+                    task_type=TaskType(item["task_type"]),
+                    description=item.get("description", ""),
+                    parameters=item.get("parameters", {}),
+                    dependencies=item.get("dependencies", []),
+                    priority=Priority(item.get("priority", "MEDIUM")),
+                    assigned_agent=item.get("agent", ""),
+                    assigned_skill=item.get("skill"),
+                    created_at=datetime.now().isoformat(),
+                    estimated_tokens=self._estimate_tokens(TaskType(item["task_type"])),
+                    estimated_time_seconds=self._estimate_time(TaskType(item["task_type"])),
+                )
+                tasks.append(task)
+            except (ValueError, KeyError) as e:
+                logger.warning(f"[任务规划] ⚠️ 跳过无效任务项: {item}, 错误: {e}")
+                continue
+
+        if not tasks:
+            logger.warning("[任务规划] ⚠️ LLM 未生成有效任务，使用默认模板")
+            fallback_template = TASK_TEMPLATES.get("financial_analysis", [])
+            tasks = self._instantiate_tasks(fallback_template, request.slots or {}, request.query)
+
+        plan = TaskPlan(
+            plan_id=str(uuid.uuid4())[:8],
+            user_query=request.query,
+            intent=request.intent or "unknown",
+            tasks=tasks,
+            total_tasks=len(tasks),
+            created_at=datetime.now().isoformat(),
+            planning_strategy="llm_generated",
+        )
+        plan.critical_path_length = len(self._optimize_execution_order(tasks))
+        plan.parallel_groups = sum(1 for g in self._optimize_execution_order(tasks) if len(g) > 1)
+        return plan
 
     def _instantiate_tasks(
         self,

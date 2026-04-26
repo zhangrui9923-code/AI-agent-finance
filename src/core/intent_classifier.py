@@ -1233,6 +1233,10 @@ class EnhancedIntentClassifier:
 # ════════════════════════════════════════════════════════════
 
 
+# Module-level singleton to avoid creating new LLM clients on every call
+_classifier_instance: Optional["EnhancedIntentClassifier"] = None
+
+
 def classify_intent(
     query: str,
     context: Optional[str] = None,
@@ -1256,8 +1260,10 @@ def classify_intent(
         >>> print(result.confidence)
         0.92
     """
-    classifier = EnhancedIntentClassifier()
-    return classifier.classify(query, context, slots)
+    global _classifier_instance
+    if _classifier_instance is None:
+        _classifier_instance = EnhancedIntentClassifier()
+    return _classifier_instance.classify(query, context, slots)
 
 
 # ════════════════════════════════════════════════════════════
