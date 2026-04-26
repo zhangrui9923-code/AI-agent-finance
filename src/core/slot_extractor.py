@@ -1296,7 +1296,7 @@ class SlotExtractor:
         for category, metrics_list in FINANCIAL_METRICS.items():
             for metric in metrics_list:
                 if metric.lower() in query.lower() or metric in query:
-                    if len(primary_metrics) < 3:
+                    if len(primary_metrics) < 5:
                         primary_metrics.append(metric)
                     else:
                         secondary_metrics.append(metric)

@@ -1045,6 +1045,8 @@ class EnhancedAgentState(TypedDict):
 # ══════════════════════════════════════════════════════════════
 
 # ── 意图类型常量（8大主意图）─────────────────────────────
+# 【注意】以下常量已废弃，请从 src.core.intent_classifier.PrimaryIntent 导入
+# 此处保留仅为向后兼容，新代码请勿使用
 
 INTENT_FINANCIAL_ANALYSIS: str = "financial_analysis"""
 """财务分析意图标识符

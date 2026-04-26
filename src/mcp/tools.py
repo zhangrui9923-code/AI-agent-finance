@@ -8,6 +8,10 @@ MCP 金融工具实现层
   3. 财务计算器   — 精确计算财务指标（避免 LLM 数学幻觉）
 
 数据源：Alpha Vantage（免费 API，FINANCE_API_KEY 配置在 .env）
+
+【限流说明】Alpha Vantage 免费版每日 25 次请求限制。
+当前使用 tenacity 重试（最多3次），但无法防止日限额耗尽。
+如需高频率使用，建议申请 Premium API Key 或接入其他数据源。
 """
 
 from __future__ import annotations

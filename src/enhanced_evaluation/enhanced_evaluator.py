@@ -15,10 +15,13 @@
   ❌ 无改进指引 → 只知道"不好"，不知道"如何改好"
 
 本框架的解决方案:
-  ✅ 5 大维度覆盖全链路 (RAG/Agent/Output/System/User)
+  ✅ 3 大维度覆盖核心链路 (RAG/Agent/Output)
   ✅ 15+ 细分指标，精确定位问题根因
   ✅ 自动生成改进建议，形成闭环优化
   ✅ 结构化报告，支持趋势追踪和对比分析
+
+  【注意】System Performance 和 User Satisfaction 维度为规划中，
+  暂未实现。如需使用，请自行扩展。
 
 【评估体系架构】
 
@@ -31,7 +34,7 @@
   ┌─────────┐┌─────────┐┌─────────┐┌─────────┐┌─────────┐
   │RAG Quality││Agent    ││Output   ││System   ││User     │
   │Evaluator ││Quality  ││Quality  ││Perform. ││Satisf.  │
-  │          ││Evaluator││Evaluator││Evaluator││Predictor│
+  │          ││Evaluator││Evaluator││(TBD)    ││(TBD)    │
   ├─────────┤├─────────┤├─────────┤├─────────┤├─────────┤
   │Faithful ││Goal     ││Profess. ││Latency  ││Complete │
   │ness     ││Achieve. ││Data Acc.││Token Eff││Clarity  │
@@ -602,34 +605,12 @@ class RAGQualityEvaluator:
     def __init__(self, use_llm: bool = False):
         """
         初始化 RAG 质量评估器
-        
+
         Args:
-            use_llm: 是否使用 LLM 进行辅助评估
-                    开启后精度更高但速度较慢
+            use_llm: 参数保留但暂未实现（评估方法目前全部为规则驱动）
+                    如需 LLM 辅助评估，请自行扩展各 _evaluate_* 方法
         """
-        self.use_llm = use_llm
-        self._llm = None
-        self._embeddings = None
-        
-        if use_llm:
-            try:
-                from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-                from config.settings import GLM_API_KEY, GLM_BASE_URL, LLM_MODEL, EMBEDDING_MODEL
-                
-                self._llm = ChatOpenAI(
-                    model=LLM_MODEL,
-                    openai_api_key=GLM_API_KEY,
-                    openai_api_base=GLM_BASE_URL,
-                    temperature=0,
-                )
-                self._embeddings = OpenAIEmbeddings(
-                    model=EMBEDDING_MODEL,
-                    openai_api_key=GLM_API_KEY,
-                    openai_api_base=GLM_BASE_URL,
-                )
-            except Exception as e:
-                print(f"[RAG评估] ⚠️ LLM 初始化失败，回退到规则模式: {e}")
-                self.use_llm = False
+        self.use_llm = False  # 强制为 False，当前实现不支持 LLM 评估
     
     def evaluate(
         self,
